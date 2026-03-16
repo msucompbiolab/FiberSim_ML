@@ -35,10 +35,13 @@ def build_training_arrays(
         .reshape(-1, 1)
         .astype(float)
     )
+
+    #x_params = x_params[0:4] # LCL HACK
     t_values = pd.to_numeric(target_df.iloc[:, 0], errors="coerce").to_numpy().astype(float)
 
     target_start_col_0based = target_start_col_1based - 1
     target_cols = list(range(target_start_col_0based, target_df.shape[1], target_step))
+    #target_cols = target_cols[0:4] # LCL HACK
     y_raw = (
         target_df.iloc[:, target_cols]
         .apply(pd.to_numeric, errors="coerce")
@@ -150,11 +153,11 @@ class TimeSeriesRegressor(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(2, 32),
+            nn.Linear(2, 128),
             nn.ReLU(),
-            nn.Linear(32, 32),
+            nn.Linear(128, 128),
             nn.ReLU(),
-            nn.Linear(32, 1),
+            nn.Linear(128, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -217,7 +220,13 @@ def train_cpu(
     lr: float = 1e-3,
     time_downsample_factor: int = 5,
 ) -> None:
-    device = torch.device("cpu")
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"GPU: {torch.cuda.get_device_name(0)} is available.")
+    else:
+        device = torch.device("cpu")
+        print("No GPU available. Training will run on CPU.")
 
     x_params, y_series, t_values = build_training_arrays(
         feature_file_path=feature_file_path,
@@ -319,6 +328,6 @@ if __name__ == "__main__":
     train_cpu(
         feature_file_path="parameter_values.xlsx",
         target_file_path="summary_n_vars_1_part_1.txt",
-        epochs=2000,
+        epochs=1000,
         time_downsample_factor=5,
     )
