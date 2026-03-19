@@ -2,62 +2,147 @@ import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
+from pathlib import Path
 from sklearn.preprocessing import MinMaxScaler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from readdata import read_excel_data, read_tab_delimited_data
+from readdata import read_tab_delimited_data
 
 
 def build_training_arrays(
-    feature_file_path: str = "parameter_values.xlsx",
-    target_file_path: str = "summary_n_vars_1_part_1.txt",
+    feature_file_path: str = "data2",
+    target_file_path: str = "data2",
     target_start_col_1based: int = 4,
     target_step: int = 3,
     time_downsample_factor: int = 5,
+    max_feature_rows: int | None = 900,
+    max_target_part: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Build arrays from two files:
-    - parameter feature: first column from parameter_values.xlsx
-    - time values: first column from summary_n_vars_1_part_1.txt
-    - target series: columns 4, 7, 10, ... from summary_n_vars_1_part_1.txt
+    Build arrays from one or more target txt files and matching metadata files:
+    - parameter feature: last numeric metadata column from summary_n_vars_1_part_<n>_metadata.txt
+    - time values: first column from the target txt data
+    - target series: columns 4, 7, 10, ... from each target txt file
     Returns:
     - x_params: shape [n_samples, 1]
     - y_series: shape [n_samples, n_time]
     - t_values: shape [n_time]
     """
-    feature_df = read_excel_data(feature_file_path)
-    target_df = read_tab_delimited_data(target_file_path)
+    def get_part_number(path: Path) -> int | None:
+        suffix = path.stem.rsplit("_part_", 1)
+        if len(suffix) == 2 and suffix[1].isdigit():
+            return int(suffix[1])
+        return None
 
-    x_params = (
-        pd.to_numeric(feature_df.iloc[:, 0], errors="coerce")
-        .to_numpy()
-        .reshape(-1, 1)
-        .astype(float)
-    )
+    def sort_key(path: Path) -> tuple[int, str]:
+        part_number = get_part_number(path)
+        if part_number is not None:
+            return part_number, path.name
+        return float("inf"), path.name
 
-    #x_params = x_params[0:4] # LCL HACK
-    t_values = pd.to_numeric(target_df.iloc[:, 0], errors="coerce").to_numpy().astype(float)
-
-    target_start_col_0based = target_start_col_1based - 1
-    target_cols = list(range(target_start_col_0based, target_df.shape[1], target_step))
-    #target_cols = target_cols[0:4] # LCL HACK
-    y_raw = (
-        target_df.iloc[:, target_cols]
-        .apply(pd.to_numeric, errors="coerce")
-        .to_numpy()
-        .astype(float)
-    )
-
-    # Arrange targets as [n_samples, n_time], aligned with time length.
-    if y_raw.shape[0] == t_values.shape[0]:
-        y_series = y_raw.T
-    elif y_raw.shape[1] == t_values.shape[0]:
-        y_series = y_raw
-    else:
-        raise ValueError(
-            f"Time length mismatch: time has {t_values.shape[0]} rows, target matrix shape is {y_raw.shape}."
+    def extract_target_series(target_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        t_values_local = (
+            pd.to_numeric(target_df.iloc[:, 0], errors="coerce").to_numpy().astype(float)
         )
+
+        target_start_col_0based = target_start_col_1based - 1
+        target_cols_local = list(range(target_start_col_0based, target_df.shape[1], target_step))
+        y_raw_local = (
+            target_df.iloc[:, target_cols_local]
+            .apply(pd.to_numeric, errors="coerce")
+            .to_numpy()
+            .astype(float)
+        )
+
+        if y_raw_local.shape[0] == t_values_local.shape[0]:
+            return y_raw_local.T, t_values_local
+        if y_raw_local.shape[1] == t_values_local.shape[0]:
+            return y_raw_local, t_values_local
+
+        raise ValueError(
+            f"Time length mismatch: time has {t_values_local.shape[0]} rows, "
+            f"target matrix shape is {y_raw_local.shape}."
+        )
+
+    def get_metadata_file(target_file: Path, metadata_root: Path) -> Path:
+        metadata_file = metadata_root / f"{target_file.stem}_metadata.txt"
+        if not metadata_file.is_file():
+            raise FileNotFoundError(f"Metadata file not found for {target_file.name}: {metadata_file}")
+        return metadata_file
+
+    def extract_feature_array(metadata_df: pd.DataFrame, metadata_file: Path) -> np.ndarray:
+        excluded_cols = {"sim_number", "sample_id", "sim_file"}
+        feature_cols = [col for col in metadata_df.columns if col not in excluded_cols]
+        if not feature_cols:
+            raise ValueError(f"No feature columns found in metadata file: {metadata_file}")
+
+        feature_values = pd.to_numeric(metadata_df[feature_cols[-1]], errors="coerce")
+        return feature_values.to_numpy().reshape(-1, 1).astype(float)
+
+    feature_path = Path(feature_file_path)
+    target_path = Path(target_file_path)
+
+    if target_path.is_dir():
+        target_files = sorted(
+            [path for path in target_path.glob("*.txt") if not path.name.endswith("_metadata.txt")],
+            key=sort_key,
+        )
+        if max_target_part is not None:
+            target_files = [
+                path
+                for path in target_files
+                if (get_part_number(path) is not None and get_part_number(path) <= max_target_part)
+            ]
+    elif target_path.is_file():
+        target_files = [target_path]
+    else:
+        raise FileNotFoundError(f"Target path not found: {target_file_path}")
+
+    if not target_files:
+        raise FileNotFoundError(f"No .txt target files found in: {target_file_path}")
+
+    if not feature_path.is_dir():
+        raise FileNotFoundError(f"Feature metadata directory not found: {feature_file_path}")
+
+    x_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    t_values: np.ndarray | None = None
+
+    for target_file in target_files:
+        target_df = read_tab_delimited_data(str(target_file))
+        y_part, t_part = extract_target_series(target_df)
+        metadata_file = get_metadata_file(target_file, feature_path)
+        metadata_df = read_tab_delimited_data(str(metadata_file))
+        x_part = extract_feature_array(metadata_df, metadata_file)
+        print(
+            f"{target_file.name}: {t_part.shape[0]} timepoints, "
+            f"{y_part.shape[0]} data series"
+        )
+
+        if t_values is None:
+            t_values = t_part
+        elif t_values.shape != t_part.shape or not np.allclose(t_values, t_part, equal_nan=True):
+            raise ValueError(
+                f"Time values in {target_file} do not match the earlier target files."
+            )
+
+        if x_part.shape[0] != y_part.shape[0]:
+            raise ValueError(
+                f"Metadata mismatch in {metadata_file.name}: features have {x_part.shape[0]} rows, "
+                f"targets have {y_part.shape[0]} series."
+            )
+
+        x_parts.append(x_part)
+        y_parts.append(y_part)
+
+    x_params = np.vstack(x_parts)
+    y_series = np.vstack(y_parts)
+    assert t_values is not None
+
+    if max_feature_rows is not None:
+        x_params = x_params[:max_feature_rows]
+        y_series = y_series[:max_feature_rows]
 
     if x_params.shape[0] != y_series.shape[0]:
         raise ValueError(
@@ -213,20 +298,20 @@ def plot_loss_curves(
 
 
 def train_cpu(
-    feature_file_path: str = "parameter_values.xlsx",
-    target_file_path: str = "summary_n_vars_1_part_1.txt",
+    feature_file_path: str = "data2",
+    target_file_path: str = "data2",
     epochs: int = 200,
     batch_size: int = 32,
     lr: float = 1e-3,
     time_downsample_factor: int = 5,
 ) -> None:
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        print(f"GPU: {torch.cuda.get_device_name(0)} is available.")
-    else:
-        device = torch.device("cpu")
-        print("No GPU available. Training will run on CPU.")
+    #if torch.cuda.is_available():
+    #    device = torch.device("cuda")
+    #    print(f"GPU: {torch.cuda.get_device_name(0)} is available.")
+    #else:
+    device = torch.device("cpu")
+    print("No GPU available. Training will run on CPU.")
 
     x_params, y_series, t_values = build_training_arrays(
         feature_file_path=feature_file_path,
@@ -326,8 +411,8 @@ def train_cpu(
 
 if __name__ == "__main__":
     train_cpu(
-        feature_file_path="parameter_values.xlsx",
-        target_file_path="summary_n_vars_1_part_1.txt",
+        feature_file_path="data2",
+        target_file_path="data2",
         epochs=1000,
-        time_downsample_factor=5,
+        time_downsample_factor=50,
     )
