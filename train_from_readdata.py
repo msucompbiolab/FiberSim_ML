@@ -18,6 +18,9 @@ def build_training_arrays(
     time_downsample_factor: int = 5,
     max_feature_rows: int | None = 900,
     max_target_part: int | None = None,
+    subset_fraction: float | None = None,
+    subset_n_samples: int | None = None,
+    subset_seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Build arrays from one or more target txt files and matching metadata files:
@@ -163,6 +166,26 @@ def build_training_arrays(
         t_values = t_values[::time_downsample_factor]
         y_series = y_series[:, ::time_downsample_factor]
 
+    if subset_fraction is not None and subset_n_samples is not None:
+        raise ValueError("Set only one of subset_fraction or subset_n_samples.")
+
+    n_samples = x_params.shape[0]
+    if subset_fraction is not None:
+        if not 0 < subset_fraction <= 1:
+            raise ValueError("subset_fraction must be in the range (0, 1].")
+        subset_n_samples = max(1, int(round(n_samples * subset_fraction)))
+
+    if subset_n_samples is not None:
+        if not 1 <= subset_n_samples <= n_samples:
+            raise ValueError(
+                f"subset_n_samples must be between 1 and {n_samples}, got {subset_n_samples}."
+            )
+        rng = np.random.default_rng(subset_seed)
+        subset_indices = np.sort(rng.choice(n_samples, size=subset_n_samples, replace=False))
+        x_params = x_params[subset_indices]
+        y_series = y_series[subset_indices]
+        print(f"Random subset selected: {subset_n_samples} of {n_samples} samples")
+
     return x_params, y_series, t_values
 
 
@@ -186,6 +209,23 @@ def split_train_eval(
     train_idx = indices[:n_train]
     eval_idx = indices[n_train:]
     return x[train_idx], y[train_idx], x[eval_idx], y[eval_idx]
+
+
+def get_train_eval_indices(
+    n_samples: int,
+    train_ratio: float = 0.8,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return train/eval indices for a reproducible sample-wise split."""
+    if n_samples < 2:
+        raise ValueError("Need at least 2 samples to perform an 80/20 split.")
+
+    n_train = max(1, int(n_samples * train_ratio))
+    n_train = min(n_train, n_samples - 1)
+
+    rng = np.random.default_rng(seed)
+    indices = rng.permutation(n_samples)
+    return indices[:n_train], indices[n_train:]
 
 
 def build_point_dataset(
@@ -249,12 +289,39 @@ class TimeSeriesRegressor(nn.Module):
         return self.net(x)
 
 
+def predict_series(
+    model: nn.Module,
+    x_points: np.ndarray,
+    y_points: np.ndarray,
+    y_shape: tuple[int, int],
+    x_scaler: MinMaxScaler,
+    y_scaler: MinMaxScaler,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Run model inference and reshape flat point predictions back to series."""
+    x_tensor = torch.tensor(x_scaler.transform(x_points), dtype=torch.float32).to(device)
+    y_tensor = torch.tensor(y_scaler.transform(y_points), dtype=torch.float32).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        pred_scaled = model(x_tensor)
+        mse_loss = nn.MSELoss()(pred_scaled, y_tensor).item()
+
+    y_true_flat = y_scaler.inverse_transform(y_tensor.cpu().numpy()).reshape(-1)
+    y_pred_flat = y_scaler.inverse_transform(pred_scaled.cpu().numpy()).reshape(-1)
+
+    y_true_series = y_true_flat.reshape(y_shape)
+    y_pred_series = y_pred_flat.reshape(y_shape)
+    return y_true_series, y_pred_series, mse_loss
+
+
 def plot_eval_predictions(
     t_values: np.ndarray,
     y_true: np.ndarray,
     y_pred: np.ndarray,
     output_path: str = "evaluation_timeseries_plot.png",
     max_series: int = 5,
+    x_features: np.ndarray | None = None,
 ) -> None:
     """Plot predicted vs actual time series for evaluation samples."""
     n_plot = min(max_series, y_true.shape[0])
@@ -269,10 +336,58 @@ def plot_eval_predictions(
         axes[i].plot(t_values, y_true[i], label="Actual")
         axes[i].plot(t_values, y_pred[i], "--", label="Predicted")
         axes[i].set_ylabel("Value")
-        axes[i].set_title(f"Evaluation sample {i + 1}")
+        title = f"Evaluation sample {i + 1}"
+        if x_features is not None:
+            title += f" | feature={x_features[i, 0]:.4g}"
+        axes[i].set_title(title)
         axes[i].legend()
 
     axes[-1].set_xlabel("Time")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_all_eval_predictions(
+    t_values: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    output_path: str = "evaluation_timeseries_all_cases.png",
+    n_cols: int = 4,
+    x_features: np.ndarray | None = None,
+) -> None:
+    """Plot predicted vs actual time series for all samples in one PNG."""
+    n_plot = y_true.shape[0]
+    if n_plot == 0:
+        return
+
+    n_cols = max(1, n_cols)
+    n_rows = int(np.ceil(n_plot / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4 * n_cols, 2.5 * n_rows),
+        sharex=True,
+    )
+    axes = np.atleast_1d(axes).reshape(n_rows, n_cols)
+
+    for i in range(n_rows * n_cols):
+        ax = axes.flat[i]
+        if i >= n_plot:
+            ax.axis("off")
+            continue
+
+        ax.plot(t_values, y_true[i], label="Actual")
+        ax.plot(t_values, y_pred[i], "--", label="Predicted")
+        title = f"Sample {i + 1}"
+        if x_features is not None:
+            title += f" | feature={x_features[i, 0]:.4g}"
+        ax.set_title(title)
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Value")
+        if i == 0:
+            ax.legend()
+
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -297,6 +412,42 @@ def plot_loss_curves(
     plt.close()
 
 
+def save_checkpoint(
+    model: nn.Module,
+    x_scaler: MinMaxScaler,
+    y_scaler: MinMaxScaler,
+    checkpoint_path: str,
+    eval_indices: np.ndarray,
+    train_indices: np.ndarray,
+    split_seed: int,
+    train_ratio: float,
+) -> None:
+    """Save model weights and fitted scalers for later evaluation."""
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "x_scaler": x_scaler,
+            "y_scaler": y_scaler,
+            "eval_indices": eval_indices,
+            "train_indices": train_indices,
+            "split_seed": split_seed,
+            "train_ratio": train_ratio,
+        },
+        checkpoint_path,
+    )
+
+
+def load_checkpoint(
+    checkpoint_path: str,
+    device: torch.device,
+) -> tuple[TimeSeriesRegressor, MinMaxScaler, MinMaxScaler, dict]:
+    """Load a saved model checkpoint and scalers."""
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model = TimeSeriesRegressor().to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model, checkpoint["x_scaler"], checkpoint["y_scaler"], checkpoint
+
+
 def train_cpu(
     feature_file_path: str = "data2",
     target_file_path: str = "data2",
@@ -304,6 +455,13 @@ def train_cpu(
     batch_size: int = 32,
     lr: float = 1e-3,
     time_downsample_factor: int = 5,
+    subset_fraction: float | None = None,
+    subset_n_samples: int | None = None,
+    subset_seed: int = 42,
+    train_ratio: float = 0.8,
+    split_seed: int = 42,
+    checkpoint_path: str = "timeseries_model_cpu.pt",
+    loss_plot_path: str = "loss_curve.png",
 ) -> None:
 
     #if torch.cuda.is_available():
@@ -317,11 +475,16 @@ def train_cpu(
         feature_file_path=feature_file_path,
         target_file_path=target_file_path,
         time_downsample_factor=time_downsample_factor,
+        subset_fraction=subset_fraction,
+        subset_n_samples=subset_n_samples,
+        subset_seed=subset_seed,
     )
 
-    x_train_s, y_train_s, x_eval_s, y_eval_s = split_train_eval(
-        x_params, y_series, train_ratio=0.8, seed=42
+    train_idx, eval_idx = get_train_eval_indices(
+        x_params.shape[0], train_ratio=train_ratio, seed=split_seed
     )
+    x_train_s, y_train_s = x_params[train_idx], y_series[train_idx]
+    x_eval_s, y_eval_s = x_params[eval_idx], y_series[eval_idx]
     print(
         f"Train samples: {x_train_s.shape[0]} | Eval samples: {x_eval_s.shape[0]} | "
         f"Time points: {t_values.shape[0]}"
@@ -330,7 +493,7 @@ def train_cpu(
     x_train_points, y_train_points = build_point_dataset(x_train_s, y_train_s, t_values)
     x_eval_points, y_eval_points = build_point_dataset(x_eval_s, y_eval_s, t_values)
 
-    x_train, y_train, x_eval, y_eval, _, y_scaler = scale_train_eval(
+    x_train, y_train, x_eval, y_eval, x_scaler, y_scaler = scale_train_eval(
         x_train_points, y_train_points, x_eval_points, y_eval_points
     )
 
@@ -379,40 +542,92 @@ def train_cpu(
     with torch.no_grad():
         eval_pred = model(x_eval.to(device))
         eval_loss = criterion(eval_pred, y_eval.to(device)).item()
-    print(f"Evaluation Loss (MSE): {eval_loss:.6f}")
+    print(f"Final validation loss (MSE): {eval_loss:.6f}")
 
-    y_true_flat = y_scaler.inverse_transform(y_eval.cpu().numpy()).reshape(-1)
-    y_pred_flat = y_scaler.inverse_transform(eval_pred.cpu().numpy()).reshape(-1)
-
-    n_eval_samples = y_eval_s.shape[0]
-    n_time = t_values.shape[0]
-    y_true_series = y_true_flat.reshape(n_eval_samples, n_time)
-    y_pred_series = y_pred_flat.reshape(n_eval_samples, n_time)
-
-    plot_eval_predictions(
-        t_values=t_values,
-        y_true=y_true_series,
-        y_pred=y_pred_series,
-        output_path="evaluation_timeseries_plot.png",
-        max_series=5,
-    )
     plot_loss_curves(
         train_losses=train_losses,
         eval_losses=eval_losses,
-        output_path="loss_curve.png",
+        output_path=loss_plot_path,
     )
 
-    torch.save(model.state_dict(), "timeseries_model_cpu.pt")
-    print(
-        "Training complete. Model saved to timeseries_model_cpu.pt, "
-        "plots saved to evaluation_timeseries_plot.png and loss_curve.png"
+    save_checkpoint(
+        model,
+        x_scaler,
+        y_scaler,
+        checkpoint_path,
+        eval_indices=eval_idx,
+        train_indices=train_idx,
+        split_seed=split_seed,
+        train_ratio=train_ratio,
     )
+    print(
+        f"Training complete. Checkpoint saved to {checkpoint_path}, "
+        f"loss plot saved to {loss_plot_path}"
+    )
+
+
+def evaluate_saved_model(
+    feature_file_path: str = "data2",
+    target_file_path: str = "data2",
+    checkpoint_path: str = "timeseries_model_cpu.pt",
+    time_downsample_factor: int = 5,
+    max_feature_rows: int | None = 900,
+    max_target_part: int | None = None,
+    output_path: str = "evaluation_timeseries_validation_cases.png",
+) -> None:
+    """Load a saved checkpoint, evaluate it on the held-out validation cases, and plot them."""
+    device = torch.device("cpu")
+    model, x_scaler, y_scaler, checkpoint = load_checkpoint(checkpoint_path, device)
+
+    x_params, y_series, t_values = build_training_arrays(
+        feature_file_path=feature_file_path,
+        target_file_path=target_file_path,
+        time_downsample_factor=time_downsample_factor,
+        max_feature_rows=max_feature_rows,
+        max_target_part=max_target_part,
+    )
+    eval_indices = np.asarray(checkpoint["eval_indices"])
+    x_eval_s = x_params[eval_indices]
+    y_eval_s = y_series[eval_indices]
+    print(
+        f"Evaluating {x_eval_s.shape[0]} validation samples across {t_values.shape[0]} time points "
+        f"using checkpoint {checkpoint_path}"
+    )
+
+    x_points, y_points = build_point_dataset(x_eval_s, y_eval_s, t_values)
+    y_true_series, y_pred_series, mse_loss = predict_series(
+        model=model,
+        x_points=x_points,
+        y_points=y_points,
+        y_shape=(y_eval_s.shape[0], t_values.shape[0]),
+        x_scaler=x_scaler,
+        y_scaler=y_scaler,
+        device=device,
+    )
+    print(f"Evaluation Loss (MSE) on validation cases: {mse_loss:.6f}")
+
+    plot_all_eval_predictions(
+        t_values=t_values,
+        y_true=y_true_series,
+        y_pred=y_pred_series,
+        output_path=output_path,
+        x_features=x_eval_s,
+    )
+    print(f"Saved validation-case evaluation plot to {output_path}")
 
 
 if __name__ == "__main__":
     train_cpu(
         feature_file_path="data2",
         target_file_path="data2",
-        epochs=1000,
+        epochs=500,
         time_downsample_factor=50,
+        subset_fraction=0.25,
+    )
+    evaluate_saved_model(
+        feature_file_path="data2",
+        target_file_path="data2",
+        checkpoint_path="timeseries_model_cpu.pt",
+        time_downsample_factor=50,
+        output_path="evaluation_timeseries_validation_cases.png",
     )
