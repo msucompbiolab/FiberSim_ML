@@ -23,6 +23,12 @@ Both scripts:
 - `loss_curve.png` and `loss_curve_n_var3.png`: training and validation loss plots
 - `evaluation_timeseries_validation_cases.png` and `evaluation_timeseries_validation_cases_n_var3.png`: predicted vs. actual validation plots
 
+## Data directories
+
+- `data2/`: default tab-delimited training data for the 1-variable workflow
+- `data_n_var3/`: default tab-delimited training data for the 3-variable workflow
+- `data_afterload/`: separate CSV-based dataset currently not used by these two training scripts
+
 ## Run
 
 Install dependencies with your preferred environment manager, then run:
